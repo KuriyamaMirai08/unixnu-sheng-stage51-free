@@ -1,0 +1,180 @@
+name: Stage52 public XNU bootstrap and sheng archives
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  compile:
+    if: github.event.repository.private == false
+    runs-on: macos-26
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+      GIT_LFS_SKIP_SMUDGE: '1'
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+      HOMEBREW_NO_INSTALL_CLEANUP: '1'
+    steps:
+      - name: Check runner capacity and toolchain
+        run: |
+          set -euo pipefail
+          sw_vers
+          test "$(uname -m)" = arm64
+          test "$(sysctl -n hw.memsize)" -ge 6442450944
+          df -h "$GITHUB_WORKSPACE"
+          df -Pk "$GITHUB_WORKSPACE" | awk 'NR == 2 { exit !($4 >= 12582912) }'
+          vm_stat
+          xcodebuild -version
+          xcodebuild -version | grep -Fx 'Build version 17F113'
+          test "$(xcrun --sdk iphoneos --show-sdk-version)" = 26.5
+          xcrun --sdk iphoneos clang --version
+      - name: Frozen UniXNU
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: UniXNU/UniXNU
+          ref: 13e5973748a8447cbb90520c9a2dd5e65e272435
+          path: UniXNU
+          submodules: recursive
+          persist-credentials: false
+      - name: Frozen sheng board
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: UniXNU/UniXNU-sheng
+          ref: 460179565a018c741b93e0b1efa07c55d4de497a
+          path: UniXNU-sheng
+          submodules: recursive
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.13'
+      - name: Prepare public build tools
+        run: |
+          set -euo pipefail
+          brew install llvm
+          if ! command -v unifdef; then
+            brew install unifdef
+            echo "$(brew --prefix unifdef)/bin" >> "$GITHUB_PATH"
+          fi
+          brew list --versions llvm
+          "$(brew --prefix llvm)/bin/llvm-objcopy" --version
+          cmake --version
+          ninja --version
+          python3 --version
+      - name: Run official XNU bootstrap and selected archive recipes
+        working-directory: UniXNU
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git submodule status --recursive
+          git -C ../UniXNU-sheng submodule status --recursive
+          df -Pk "$GITHUB_WORKSPACE" | awk 'NR == 2 { exit !($4 >= 8388608) }'
+          ./unixnu defconfig sheng_ipados27_defconfig --os 27 -D ../UniXNU-sheng
+          python3 -u - <<'PY'
+          import hashlib, json, os, re, shlex, shutil, struct, subprocess
+          import sys, threading
+          from pathlib import Path
+          sys.path.insert(0, 'scripts')
+          from unixnu import cli, feeds, kernel, patches
+          from unixnu.config import Context
+
+          ctx = Context(cli.parser().parse_args([
+              'build', 'kernel', '--os', '27', '-D', '../UniXNU-sheng', '-j', '2'
+          ]))
+          assert ctx.soc.commit == 'a9f45dc60c035084b95463781538380f4c3606c9'
+          modules = feeds.resolve(ctx)
+          wanted = set(cli.REFERENCES['kernel'])
+          for module in modules.values():
+              if module.origin == 'git' and (module.kind != 'refer' or module.name in wanted):
+                  pin = feeds.pinned_revision(ctx, module, {})
+                  url = module.source['git']
+                  assert pin and re.fullmatch('[0-9a-f]{40}', pin), module.name
+                  assert url.startswith('https://github.com/'), module.name
+                  print('git pin', module.name, pin, url)
+          modules = cli.prepare(ctx, ['kernel'])
+          for name, kind, pin in [
+              ('xnu', 'refer', 'ac9718fb1af618d5ce8678d0dc6e8a58f252216f'),
+              ('IOStorageFamily', 'refer', '7edb88fbae296fb7c8ce2f64e115e116e566d51c'),
+              ('ArmCpu', 'driver', '93a5030c5d983d0ef90f0fca93879d6e36ad1ba8'),
+              ('ArmDTPlatform', 'driver', '417ff95d6a6e8607ddea9309ec45c3bfd4a67c60'),
+              ('ShengUfs', 'driver', 'af14068c329f4d8693d20a3ed38a435ade04bb75'),
+          ]:
+              assert feeds.git(modules[kind, name].path, 'rev-parse', 'HEAD').strip() == pin, name
+
+          versions = kernel.version_env(modules, ctx)
+          # The official header resolver accepts a commit in place of a tag.
+          versions['UNIXNU_DRIVERKIT_TAG'] = 'ac9718fb1af618d5ce8678d0dc6e8a58f252216f'
+          versions['UNIXNU_TRUSTCACHE_TAG'] = 'aca3beaa3dfbd42498b42c5e5ce20a938e6554e5'
+          os.environ.update(versions)
+          patch_list = patches.prepare(ctx, modules)
+          generated = ctx.tree / 'build/generated'
+          generated.mkdir(parents=True, exist_ok=True)
+          env = dict(os.environ, **kernel.xnu_env(ctx))
+          env.update(UNIXNU_PATCH_LIST=str(patch_list), UNIXNU_GENERATED_DIR=str(generated),
+                     UNIXNU_DEVICE=str(ctx.device), JOBS='2')
+
+          def execute(command, options):
+              print('+', shlex.join(map(str, command)), flush=True)
+              process = subprocess.Popen(command, cwd=ctx.tree, env=options)
+              done = threading.Event()
+              def monitor():
+                  while not done.wait(30):
+                      used = subprocess.run(['du', '-sk', str(ctx.tree)], capture_output=True, text=True)
+                      free = shutil.disk_usage(ctx.tree).free
+                      print(f'build growth: {used.stdout.strip()} KiB; free={free} bytes', flush=True)
+              thread = threading.Thread(target=monitor, daemon=True)
+              thread.start()
+              rc = process.wait()
+              done.set()
+              thread.join()
+              print(f'exit={rc}', flush=True)
+              return rc
+
+          def digest(path):
+              with path.open('rb') as stream:
+                  print(hashlib.file_digest(stream, 'sha256').hexdigest(), path.relative_to(ctx.tree))
+
+          rc = execute(['bash', 'scripts/build-xnu-4k-baseline.sh'],
+                       dict(env, XNU_BOOT_PROGRESS='0', XNU_BOOTSTRAP='1'))
+          obj = ctx.tree / 'build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837'
+          evidence = ('osfmk/DEVELOPMENT/startup.o', 'iokit/DEVELOPMENT/IOPlatformExpert.cpo',
+                      'bsd/DEVELOPMENT/kern_exec.o')
+          for relative in evidence:
+              path = obj / relative
+              if path.is_file():
+                  with path.open('rb') as stream:
+                      magic, cpu, subtype, kind = struct.unpack('<4I', stream.read(16))
+                  assert (magic, cpu, subtype & 0xffffff, kind) == (0xfeedfacf, 0x100000c, 2, 1), relative
+                  digest(path)
+                  record = Path(str(path) + '.json')
+                  if record.is_file():
+                      print('compile record', json.loads(record.read_text().strip().rstrip(','))['arguments'])
+          if rc:
+              raise SystemExit(rc)
+          for relative in evidence:
+              assert (obj / (relative + '.json')).is_file(), relative
+          env['PATH'] = kernel.toolchain_path(env.get('PATH'))
+          header_rc = execute(['python3', 'scripts/prepare-storage-headers.py'], env)
+          if header_rc:
+              raise SystemExit(header_rc)
+          selected = ('ArmDTPlatform', 'ArmCpu', 'ShengUfs')
+          recipes = {entry['id']: entry for kind, entry in kernel.archive_plan(ctx)
+                     if kind == 'component' and entry['id'] in selected}
+          for name in selected:
+              assert shutil.disk_usage(ctx.tree).free >= 2 * 1024**3
+              recipe = recipes[name]
+              assert recipe['build'] == ['build-arm-driver.py', name], name
+              rc = execute(['python3', 'scripts/build-arm-driver.py', name], env)
+              directory = ctx.tree / ('build/sheng-source-storage' if name == 'ShengUfs'
+                                      else str(Path(recipe['outputs'][0]).parent))
+              for record in sorted(directory.glob('*command.json')):
+                  print('compile record', record.read_text())
+              for product in sorted(directory.glob('*.o')) + sorted(directory.glob('*.a')):
+                  digest(product)
+              if rc:
+                  raise SystemExit(rc)
+              assert (ctx.tree / recipe['outputs'][0]).is_file(), name
+          print('Selected archives complete. Full board archive, final native link and prelink are outside this job.')
+          PY
