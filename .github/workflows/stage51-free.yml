@@ -1,0 +1,98 @@
+name: Stage51-Free arm64e public source compilation
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  compile:
+    if: github.event.repository.private == false
+    runs-on: macos-26
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+    steps:
+      - name: Check resources, SDK and PAC before source checkout
+        run: |
+          set -euo pipefail
+          sw_vers
+          test "$(uname -m)" = arm64
+          df -h "$GITHUB_WORKSPACE"
+          vm_stat
+          test "$(sysctl -n hw.memsize)" -ge 6442450944
+          vm_stat | awk '
+            NR == 1 { page = $8 }
+            /^Pages (free|inactive|speculative):/ { gsub(/\./, "", $NF); pages += $NF }
+            END { bytes = page * pages; printf "Estimated reclaimable memory: %.0f bytes\n", bytes; exit !(bytes >= 536870912) }
+          '
+          df -Pk "$GITHUB_WORKSPACE" | awk 'NR == 2 { exit !($4 >= 4194304) }'
+          xcodebuild -version
+          xcodebuild -version | grep -Fx 'Xcode 26.6'
+          xcodebuild -version | grep -Fx 'Build version 17F113'
+          test "$(xcrun --sdk iphoneos --show-sdk-version)" = 26.5
+          xcrun --sdk iphoneos --show-sdk-path
+          xcrun --sdk iphoneos clang --version
+          mkdir "$RUNNER_TEMP/stage51-free"
+          cat > "$RUNNER_TEMP/stage51-free/pac.s" <<'ASM'
+          .text
+          .globl _stage51_free_pac
+          _stage51_free_pac:
+            paciasp
+            autiasp
+            ret
+          ASM
+          set -x
+          xcrun --sdk iphoneos clang -target arm64e-apple-ios26.5 -c "$RUNNER_TEMP/stage51-free/pac.s" -o "$RUNNER_TEMP/stage51-free/pac.o"
+          set +x
+          /usr/bin/python3 - "$RUNNER_TEMP/stage51-free/pac.o" <<'PY'
+          import pathlib, struct, sys
+          data = pathlib.Path(sys.argv[1]).read_bytes()
+          magic, cpu, subtype, kind = struct.unpack_from('<4I', data)
+          assert (magic, cpu, subtype & 0xffffff, kind) == (0xfeedfacf, 0x100000c, 2, 1)
+          assert bytes.fromhex('3f2303d5bf2303d5c0035fd6') in data
+          print('arm64e MH_OBJECT and PAC instruction bytes verified')
+          PY
+          shasum -a 256 "$RUNNER_TEMP/stage51-free/pac.s" "$RUNNER_TEMP/stage51-free/pac.o"
+      - name: Public XNU source pinned by the UniXNU 24A446 profile
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: apple-oss-distributions/xnu
+          ref: ac9718fb1af618d5ce8678d0dc6e8a58f252216f
+          path: xnu
+          persist-credentials: false
+      - name: Public sheng touch source pinned by the device gitlink
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: UniXNU/ShengNovatekTouch
+          ref: 3b44b1b7603eaadae942ea44ddc51bdcc48ad060
+          path: touch
+          persist-credentials: false
+      - name: Compile unchanged XNU and sheng translation units
+        run: |
+          set -euo pipefail
+          test "$(git -C xnu rev-parse HEAD)" = ac9718fb1af618d5ce8678d0dc6e8a58f252216f
+          test "$(git -C touch rev-parse HEAD)" = 3b44b1b7603eaadae942ea44ddc51bdcc48ad060
+          df -Pk "$GITHUB_WORKSPACE" | awk 'NR == 2 { exit !($4 >= 2097152) }'
+          out="$RUNNER_TEMP/stage51-free"
+          sdk="$(xcrun --sdk iphoneos --show-sdk-path)"
+          shasum -a 256 xnu/bsd/dev/arm64/cpu_memcmp_mask.s touch/NvtProtocol.c touch/NvtTouchCore.c
+          set -x
+          xcrun --sdk iphoneos clang -target arm64e-apple-ios26.5 -isysroot "$sdk" \
+            -DKERNEL -DKERNEL_PRIVATE -DXNU_KERNEL_PRIVATE=1 -I xnu/osfmk -I xnu/pexpert \
+            -x assembler-with-cpp -c xnu/bsd/dev/arm64/cpu_memcmp_mask.s -o "$out/xnu.o"
+          for unit in NvtProtocol NvtTouchCore; do
+            xcrun --sdk iphoneos clang -target arm64e-apple-ios26.5 -isysroot "$sdk" \
+              -std=gnu11 -ffreestanding -c "touch/$unit.c" -o "$out/$unit.o"
+          done
+          set +x
+          /usr/bin/python3 - "$out/xnu.o" "$out/NvtProtocol.o" "$out/NvtTouchCore.o" <<'PY'
+          import pathlib, struct, sys
+          for name in sys.argv[1:]:
+              with pathlib.Path(name).open('rb') as obj:
+                  magic, cpu, subtype, kind = struct.unpack('<4I', obj.read(16))
+              assert (magic, cpu, subtype & 0xffffff, kind) == (0xfeedfacf, 0x100000c, 2, 1), name
+              print(f'{pathlib.Path(name).name}: arm64e MH_OBJECT verified')
+          PY
+          shasum -a 256 "$out/xnu.o" "$out/NvtProtocol.o" "$out/NvtTouchCore.o"
